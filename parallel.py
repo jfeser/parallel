@@ -13,23 +13,6 @@ import sys
 
 logging.basicConfig(level=logging.INFO)
 
-TIME_FMT = "".join(
-    """
-{
-  "command": "%C",
-  "time_wall_sec": %e,
-  "time_sys": %S,
-  "time_user": %U,
-  "max_rss_kb": %M,
-  "context_switch_invol": %c,
-  "context_switch_vol": %w,
-  "exit_code": %x
-}
-""".split(
-        "\n"
-    )
-)
-
 
 def cmd_to_string(cmd):
     return " ".join([shlex.quote(s) for s in cmd])
@@ -57,18 +40,28 @@ class Job:
         stderr = f"/tmp/{self.name}.err"
         properties = [
             "-p",
-            f"StandardOutput=file:{stdout}",
+            f"ExecStartPost=sh -c 'date +%s%N > {os.getcwd()}/{self.name}.start'",
             "-p",
-            f"StandardError=file:{stderr}",
+            f"StandardOutput=truncate:{stdout}",
             "-p",
-            f"ExecStopPost=cp {stdout} {stderr} {os.getcwd()}/",
+            f"StandardError=truncate:{stderr}",
+            "-p",
+            f"ExecStop=cp /sys/fs/cgroup/system.slice/{self.name}.service/memory.stat {os.getcwd()}/{self.name}.mem",
+            "-p",
+            f"ExecStop=cp /sys/fs/cgroup/system.slice/{self.name}.service/cpu.stat {os.getcwd()}/{self.name}.cpu",
+            "-p",
+            f"ExecStop=sh -c 'echo $SERVICE_RESULT $EXIT_CODE $EXIT_STATUS > {os.getcwd()}/{self.name}.exit'",
+            "-p",
+            f"ExecStartPost=sh -c 'date +%s%N > {os.getcwd()}/{self.name}.stop'",
+            "-p",
+            f"ExecStopPost=cp -f {stdout} {stderr} {os.getcwd()}/",
         ]
         if self.time_limit:
-            properties += ["--property", f"RuntimeMaxSec={self.time_limit}"]
+            properties += ["-p", f"RuntimeMaxSec={self.time_limit}"]
         if self.mem_limit:
-            properties += ["--property", f"MemoryHigh={self.mem_limit}"]
+            properties += ["-p", f"MemoryHigh={self.mem_limit}"]
         if self.stdin:
-            properties += ["--property", f"StandardInput={self.stdin}"]
+            properties += ["-p", f"StandardInput={self.stdin}"]
 
         run_args = [
             "--quiet",
@@ -78,15 +71,8 @@ class Job:
             self.name,
             "--collect",
         ] + properties
-        time_cmd = [
-            "/usr/bin/time",
-            "--output",
-            f"{self.name}.time",
-            "--format",
-            TIME_FMT,
-        ]
-        args = run_args + time_cmd + self.cmd
-        logging.debug(f"Running command: systemd-run {cmd_to_string(args)}.")
+        args = run_args + self.cmd
+        logging.debug(f"Running command: 'systemd-run {cmd_to_string(args)}'")
         proc = await asyncio.create_subprocess_exec("systemd-run", *args)
         await proc.wait()
 
@@ -151,6 +137,9 @@ async def main():
                 f"Job memory limit ({job.mem_limit}) > overall memory limit ({args.memory})."
             )
             exit(1)
+
+    await asyncio.wait([job.run() for job in jobs])
+    exit(0)
 
     total = len(jobs)
     completed = 0
